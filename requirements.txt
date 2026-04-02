@@ -1,0 +1,8 @@
+numpy
+scipy
+matplotlib
+pandas
+jupyter
+notebook
+ipykernel
+qutip
