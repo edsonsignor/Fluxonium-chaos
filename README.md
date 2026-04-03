@@ -6,6 +6,8 @@ Draft project for studying how chaos influences fluxonium readout.
 
 This repository is intended to collect numerical experiments, analysis scripts, notebooks, and supporting references for investigating signatures of chaotic dynamics in fluxonium-based readout schemes.
 
+https://github.com/nikc2003/Fluxonium_Floquet
+
 ## Planned structure
 
 - `src/`: reusable Python source code

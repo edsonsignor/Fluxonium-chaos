@@ -1,8 +1,6 @@
-numpy
-scipy
-matplotlib
-pandas
-jupyter
-notebook
-ipykernel
-qutip
+numpy==2.4.0
+scipy==1.16.3
+matplotlib==3.10.8
+ipykernel==7.1.0
+jupyter==1.1.1
+qutip==5.2.2
