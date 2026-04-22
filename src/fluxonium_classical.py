@@ -1,41 +1,52 @@
 """Classical driven fluxonium utilities.
 
-This module collects the classical tools for a single
-fluxonium degree of freedom with optional charge drive and flux drive.
+This module collects classical tools for a single fluxonium degree of freedom with
+optional charge drive and flux drive.
 
 State variables
 ---------------
 phi : reduced flux / unwrapped phase coordinate (dimensionless, lives on R)
 n   : conjugate charge-like momentum
 
-Hamiltonian
------------
+Standard fluxonium Hamiltonian (default)
+----------------------------------------
 H(phi,n,t) = 4 EC n^2
              + EL/2 * [phi - phi_ext0 - A_flux cos(omega_d t)]^2
              - EJ cos(phi)
              + A_charge cos(omega_d t) * n
 
-Conventions
------------
+Important conventions
+---------------------
 - phi is treated as an unwrapped coordinate on the real line.
 - For the undriven system, fixed points of the flow are supported.
 - For the driven system, periodic points of the stroboscopic map are supported.
-- Lyapunov exponents are computed by evolving the state and tangent matrix
-  simultaneously, with QR reorthonormalization.
+- The default Lyapunov routine follows the user's Julia workflow: first solve the
+  trajectory on a fixed grid, then propagate the tangent matrix over each block with the
+  Jacobian frozen at the saved trajectory point, followed by Gram–Schmidt.
+
+Gauge choice
+------------
+By default, the external flux enters in the inductive term, which is the standard
+fluxonium gauge. For static bias only, one can alternatively use the equivalent form
+
+    H = 4 EC n^2 + EL/2 * phi^2 - EJ cos(phi - phi_ext0) + charge-drive
+
+by setting gauge="cosine_static". This is NOT enabled for time-dependent flux drive
+(A_flux != 0), because a time-dependent coordinate shift would generate extra terms.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.optimize import brentq, root
-from typing import Dict
-
+from scipy.linalg import expm
 
 ArrayLike = Sequence[float]
+Gauge = Literal["inductive", "cosine_static"]
 
 
 @dataclass
@@ -54,6 +65,11 @@ class FluxoniumParams:
         Charge-drive amplitude multiplying n * cos(omega_d t).
     A_flux : float, default 0.0
         Flux-drive amplitude entering phi_ext(t) = phi_ext0 + A_flux cos(omega_d t).
+    gauge : {"inductive", "cosine_static"}, default "inductive"
+        Where the static flux bias is placed.
+        - "inductive": standard fluxonium gauge, EL/2 * (phi - phi_ext)^2 - EJ cos(phi)
+        - "cosine_static": static-bias equivalent gauge, EL/2 * phi^2 - EJ cos(phi - phi_ext0)
+          Only valid here when A_flux == 0.
     """
 
     EC: float
@@ -63,6 +79,7 @@ class FluxoniumParams:
     omega_d: float
     A_charge: float = 0.0
     A_flux: float = 0.0
+    gauge: Gauge = "inductive"
 
 
 # -----------------------------------------------------------------------------
@@ -79,100 +96,91 @@ def wrap_to_pi(phi: np.ndarray | float) -> np.ndarray | float:
     return (np.asarray(phi) + np.pi) % (2.0 * np.pi) - np.pi
 
 
+def wrap_to_center(phi: np.ndarray | float, center: float) -> np.ndarray | float:
+    """Wrap phase to a 2π-window centered at `center`.
+
+    This is often more informative than wrapping around zero when the interesting
+    structure sits near phi ~ pi.
+    """
+    phi_arr = np.asarray(phi)
+    return center + (phi_arr - center + np.pi) % (2.0 * np.pi) - np.pi
+
+
 def phi_ext_t(t: np.ndarray | float, p: FluxoniumParams) -> np.ndarray | float:
     """Time-dependent reduced external flux."""
     return p.phi_ext0 + p.A_flux * np.cos(p.omega_d * np.asarray(t))
 
 
+def _validate_params(p: FluxoniumParams) -> None:
+    if p.gauge == "cosine_static" and abs(p.A_flux) > 0:
+        raise ValueError(
+            "gauge='cosine_static' is implemented only for static bias (A_flux = 0). "
+            "For time-dependent flux drive, use the standard gauge='inductive'."
+        )
+
+
 # -----------------------------------------------------------------------------
-# Undriven Potential and Fixed points
+# Potential and Hamiltonian
 # -----------------------------------------------------------------------------
 
-def potential(phi: np.ndarray | float, p: FluxoniumParams, *, phi_ext: Optional[float] = None) -> np.ndarray | float:
-    """Undriven fluxonium potential or frozen-time driven potential.
+def potential(
+    phi: np.ndarray | float,
+    p: FluxoniumParams,
+    *,
+    phi_ext: Optional[float] = None,
+) -> np.ndarray | float:
+    """Undriven potential or frozen-time potential.
 
-    U(phi) = EL/2 * (phi - phi_ext)^2 - EJ cos(phi)
+    gauge='inductive':
+        U(phi) = EL/2 * (phi - phi_ext)^2 - EJ cos(phi)
 
-    Parameters
-    ----------
-    phi : float or array
-        Coordinate value(s).
-    p : FluxoniumParams
-        Model parameters.
-    phi_ext : float, optional
-        External reduced flux used in the potential. If omitted, use p.phi_ext0.
+    gauge='cosine_static' (static bias only):
+        U(phi) = EL/2 * phi^2 - EJ cos(phi - phi_ext0)
     """
-    ext = p.phi_ext0 if phi_ext is None else phi_ext
+    _validate_params(p)
     phi_arr = np.asarray(phi)
-    return 0.5 * p.EL * (phi_arr - ext) ** 2 - p.EJ * np.cos(phi_arr)
 
-def find_potential_extrema(EJ, EL, phi_ext, phi_min=-np.pi, phi_max=np.pi, nscan=10000):
-    """
-    Find extrema of U(phi) by solving U'(phi)=0:
-        U'(phi) = EL (phi - phi_ext) + EJ sin(phi)
-    """
-    def dU(phi):
-        return EL * (phi - phi_ext) + EJ * np.sin(phi)
+    if p.gauge == "inductive":
+        ext = p.phi_ext0 if phi_ext is None else phi_ext
+        return 0.5 * p.EL * (phi_arr - ext) ** 2 - p.EJ * np.cos(phi_arr)
 
-    def d2U(phi):
-        return EL + EJ * np.cos(phi)
+    ext = p.phi_ext0 if phi_ext is None else phi_ext
+    return 0.5 * p.EL * phi_arr**2 - p.EJ * np.cos(phi_arr - ext)
 
-    grid = np.linspace(phi_min, phi_max, nscan)
-    vals = dU(grid)
-
-    roots = []
-    for i in range(len(grid) - 1):
-        a, b = grid[i], grid[i+1]
-        fa, fb = vals[i], vals[i+1]
-
-        if fa == 0.0:
-            roots.append(a)
-        elif fa * fb < 0:
-            roots.append(brentq(dU, a, b))
-
-    # remove duplicates
-    roots = sorted(roots)
-    unique = []
-    for r in roots:
-        if not unique or abs(r - unique[-1]) > 1e-8:
-            unique.append(r)
-
-    minima = []
-    maxima = []
-    for r in unique:
-        if d2U(r) > 0:
-            minima.append(r)
-        elif d2U(r) < 0:
-            maxima.append(r)
-
-    return np.array(minima), np.array(maxima)
-
-
-# -----------------------------------------------------------------------------
-# Driven Hamiltonian
-# -----------------------------------------------------------------------------
 
 def hamiltonian(t: float, u: ArrayLike, p: FluxoniumParams) -> float:
     """Full time-dependent Hamiltonian evaluated on a phase-space point."""
+    _validate_params(p)
     phi, n = np.asarray(u, dtype=float)
-    ext = phi_ext_t(t, p)
+
+    if p.gauge == "inductive":
+        ext = phi_ext_t(t, p)
+        return (
+            4.0 * p.EC * n**2
+            + 0.5 * p.EL * (phi - ext) ** 2
+            - p.EJ * np.cos(phi)
+            + p.A_charge * np.cos(p.omega_d * t) * n
+        )
+
     return (
         4.0 * p.EC * n**2
-        + 0.5 * p.EL * (phi - ext) ** 2
-        - p.EJ * np.cos(phi)
+        + 0.5 * p.EL * phi**2
+        - p.EJ * np.cos(phi - p.phi_ext0)
         + p.A_charge * np.cos(p.omega_d * t) * n
     )
 
 
 def dHdt_explicit(t: float, u: ArrayLike, p: FluxoniumParams) -> float:
-    """Explicit time derivative ∂H/∂t evaluated along a trajectory.
-
-    This is useful for energy-balance diagnostics in the driven system.
-    """
+    """Explicit time derivative ∂H/∂t evaluated along a trajectory."""
+    _validate_params(p)
     phi, n = np.asarray(u, dtype=float)
     term_charge = -p.A_charge * p.omega_d * np.sin(p.omega_d * t) * n
-    term_flux = p.EL * p.A_flux * p.omega_d * np.sin(p.omega_d * t) * (phi - phi_ext_t(t, p))
-    return term_charge + term_flux
+
+    if p.gauge == "inductive":
+        term_flux = p.EL * p.A_flux * p.omega_d * np.sin(p.omega_d * t) * (phi - phi_ext_t(t, p))
+        return term_charge + term_flux
+
+    return term_charge
 
 
 # -----------------------------------------------------------------------------
@@ -181,20 +189,28 @@ def dHdt_explicit(t: float, u: ArrayLike, p: FluxoniumParams) -> float:
 
 def rhs(t: float, u: ArrayLike, p: FluxoniumParams) -> np.ndarray:
     """Classical equations of motion for the driven fluxonium."""
+    _validate_params(p)
     phi, n = np.asarray(u, dtype=float)
     dphi = 8.0 * p.EC * n + p.A_charge * np.cos(p.omega_d * t)
-    dn = -p.EL * (phi - phi_ext_t(t, p)) - p.EJ * np.sin(phi)
+
+    if p.gauge == "inductive":
+        dn = -p.EL * (phi - phi_ext_t(t, p)) - p.EJ * np.sin(phi)
+    else:
+        dn = -p.EL * phi - p.EJ * np.sin(phi - p.phi_ext0)
+
     return np.array([dphi, dn], dtype=float)
 
 
 def jacobian(t: float, u: ArrayLike, p: FluxoniumParams) -> np.ndarray:
-    """Jacobian ∂f/∂u of the 2D state-space flow.
-
-    The explicit t dependence enters only through the trajectory, not directly in
-    the matrix elements.
-    """
+    """Jacobian ∂f/∂u of the 2D state-space flow."""
+    _validate_params(p)
     phi, _n = np.asarray(u, dtype=float)
-    kappa = p.EL + p.EJ * np.cos(phi)
+
+    if p.gauge == "inductive":
+        kappa = p.EL + p.EJ * np.cos(phi)
+    else:
+        kappa = p.EL + p.EJ * np.cos(phi - p.phi_ext0)
+
     return np.array([[0.0, 8.0 * p.EC], [-kappa, 0.0]], dtype=float)
 
 
@@ -213,6 +229,72 @@ def state_tangent_rhs(t: float, y: np.ndarray, p: FluxoniumParams) -> np.ndarray
     out[:2] = du
     out[2:] = dg.ravel()
     return out
+
+
+# -----------------------------------------------------------------------------
+# Potential extrema
+# -----------------------------------------------------------------------------
+
+def find_potential_extrema(
+    p: FluxoniumParams,
+    *,
+    phi_min: float = -4.0 * np.pi,
+    phi_max: float = 4.0 * np.pi,
+    nscan: int = 20000,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Find minima and maxima of the undriven potential in the chosen gauge.
+
+    Returns
+    -------
+    minima, maxima : arrays with columns [phi, U(phi)]
+    """
+    _validate_params(p)
+
+    if p.gauge == "inductive":
+        def dU(phi):
+            return p.EL * (phi - p.phi_ext0) + p.EJ * np.sin(phi)
+
+        def d2U(phi):
+            return p.EL + p.EJ * np.cos(phi)
+    else:
+        def dU(phi):
+            return p.EL * phi + p.EJ * np.sin(phi - p.phi_ext0)
+
+        def d2U(phi):
+            return p.EL + p.EJ * np.cos(phi - p.phi_ext0)
+
+    grid = np.linspace(phi_min, phi_max, nscan)
+    vals = dU(grid)
+
+    roots: List[float] = []
+    for i in range(len(grid) - 1):
+        a, b = grid[i], grid[i + 1]
+        fa, fb = vals[i], vals[i + 1]
+        if fa == 0.0:
+            roots.append(float(a))
+        elif fa * fb < 0:
+            roots.append(float(brentq(dU, float(a), float(b))))
+
+    roots = sorted(roots)
+    unique: List[float] = []
+    for r in roots:
+        if not unique or abs(r - unique[-1]) > 1e-8:
+            unique.append(r)
+
+    minima, maxima = [], []
+    for r in unique:
+        if d2U(r) > 0:
+            minima.append(r)
+        elif d2U(r) < 0:
+            maxima.append(r)
+
+    minima = np.array(minima, dtype=float)
+    maxima = np.array(maxima, dtype=float)
+
+    return (
+        np.column_stack((minima, potential(minima, p))) if minima.size else np.empty((0, 2)),
+        np.column_stack((maxima, potential(maxima, p))) if maxima.size else np.empty((0, 2)),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -245,25 +327,23 @@ def integrate_trajectory(
     return sol
 
 
-def solve_with_work(u0, t_span, p: FluxoniumParams, t_eval=None,
-                    method="DOP853", rtol=1e-6, atol=1e-6):
-    """
-    Solve the driven fluxonium together with the accumulated work variable W.
-    """
+def solve_with_work(
+    u0,
+    t_span,
+    p: FluxoniumParams,
+    t_eval=None,
+    method="DOP853",
+    rtol=1e-6,
+    atol=1e-6,
+):
+    """Solve the driven system together with the accumulated work variable W."""
     y0 = np.array([u0[0], u0[1], 0.0], dtype=float)
 
-    def rhs_with_work(t, y, p: FluxoniumParams):
-        """
-        y = [phi, n, W]
-        where W satisfies dW/dt = ∂H/∂t
-        """
-        phi, n, W = y
-
-        dphi = 8.0 * p.EC * n + p.A_charge * np.cos(p.omega_d * t)
-        dn = -p.EL * (phi - phi_ext_t(t, p)) - p.EJ * np.sin(phi)
-        dW = dHdt_explicit(t, y[:2], p)
-
-        return np.array([dphi, dn, dW], dtype=float)
+    def rhs_with_work(t, y, p_):
+        phi, n, _w = y
+        du = rhs(t, [phi, n], p_)
+        dW = dHdt_explicit(t, [phi, n], p_)
+        return np.array([du[0], du[1], dW], dtype=float)
 
     sol = solve_ivp(
         fun=lambda t, y: rhs_with_work(t, y, p),
@@ -278,18 +358,13 @@ def solve_with_work(u0, t_span, p: FluxoniumParams, t_eval=None,
 
 
 def energy_balance_from_augmented_solution(sol, p: FluxoniumParams) -> Dict[str, np.ndarray | float]:
-    """
-    Check H(t)-H(0)-W(t), where W was evolved by the same solver.
-    """
+    """Check H(t)-H(0)-W(t), where W was evolved by the same solver."""
     t = sol.t
     y = sol.y.T
-
-    H = np.array([hamiltonian(tt, yy, p) for tt, yy in zip(t, y[:,0:2])], dtype=float)
+    H = np.array([hamiltonian(tt, yy[:2], p) for tt, yy in zip(t, y)], dtype=float)
     W = y[:, 2]
-
     delta_H = H - H[0]
     err = delta_H - W
-
     return {
         "t": t,
         "H": H,
@@ -299,6 +374,7 @@ def energy_balance_from_augmented_solution(sol, p: FluxoniumParams) -> Dict[str,
         "max_abs_error": float(np.max(np.abs(err))),
         "rms_error": float(np.sqrt(np.mean(err**2))),
     }
+
 
 # -----------------------------------------------------------------------------
 # Poincare section
@@ -337,18 +413,12 @@ def poincare_section(
     n_strobes: int = 2000,
     phase_fraction: float = 0.0,
     wrap_phi_for_plot: bool = False,
+    wrap_center: Optional[float] = None,
     method: str = "DOP853",
     rtol: float = 1e-10,
     atol: float = 1e-12,
 ) -> np.ndarray:
-    """Return stroboscopic points for a collection of initial conditions.
-
-    Notes
-    -----
-    `n_discard` is a plotting convenience for conservative Hamiltonian dynamics.
-    It discards early stroboscopic points so the figure is less dominated by the
-    arbitrary launch phase and initial placement.
-    """
+    """Return stroboscopic points for a collection of initial conditions."""
     t_period = drive_period(p)
     t_eval = phase_fraction * t_period + t_period * np.arange(n_discard + n_strobes)
     t_final = float(t_eval[-1])
@@ -366,84 +436,271 @@ def poincare_section(
         )
         pts = sol.y[:, n_discard:].T.copy()
         if wrap_phi_for_plot:
-            pts[:, 0] = wrap_to_pi(pts[:, 0])
+            center = 0.0 if wrap_center is None else float(wrap_center)
+            pts[:, 0] = wrap_to_center(pts[:, 0], center=center)
         all_points.append(pts)
 
     return np.vstack(all_points) if all_points else np.empty((0, 2), dtype=float)
 
 
 # -----------------------------------------------------------------------------
-# Lyapunov spectrum
+# Lyapunov routines
 # -----------------------------------------------------------------------------
 
-def lyapunov_spectrum(
-    u0: ArrayLike,
-    p: FluxoniumParams,
-    *,
-    t_trans: float = 100.0,
-    t_total: float = 2000.0,
-    delta_r: Optional[float] = None,
-    method: str = "DOP853",
-    rtol: float = 1e-10,
-    atol: float = 1e-12,
-) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray]:
-    """Compute the 2D Lyapunov spectrum and running largest exponent.
+def GS(A: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Classical Gram–Schmidt, matching the user's Julia routine closely.
 
-    The state and tangent matrix are evolved simultaneously. QR
-    reorthonormalization is performed every `delta_r`. For a periodically driven
-    system, using one drive period is a natural choice.
+    Returns Q, R with positive diagonal entries when the column norm is nonzero.
     """
-    if delta_r is None:
-        delta_r = drive_period(p)
+    A = np.array(A, dtype=float, copy=True)
+    M, N = A.shape
+    Q = np.zeros((M, N), dtype=float)
+    R = np.zeros((N, N), dtype=float)
 
-    y = np.zeros(6, dtype=float)
-    y[:2] = np.asarray(u0, dtype=float)
-    y[2:] = np.eye(2).ravel()
+    for j in range(N):
+        v = A[:, j].copy()
+        for k in range(j):
+            R[k, j] = np.dot(Q[:, k], v)
+            v -= R[k, j] * Q[:, k]
+
+        norm_v = np.linalg.norm(v)
+        if norm_v > 1e-12:
+            R[j, j] = norm_v
+            Q[:, j] = v / norm_v
+        else:
+            R[j, j] = 0.0
+            Q[:, j] = 0.0
+
+    return Q, R
+
+
+def G_evolution_frozenJ(t: float, g_flat: np.ndarray, J: np.ndarray) -> np.ndarray:
+    """Tangent-matrix evolution with frozen Jacobian J over one interval."""
+    G = g_flat.reshape((2, 2))
+    dG = J @ G
+    return dG.ravel()
+
+
+def lyapunov_max_julia_style(
+    u_i: ArrayLike,
+    p: FluxoniumParams,
+    N: int,
+    dt: float,
+    err: float = 1e-10,
+    transient_time: float = 100.0,
+    method: str = "DOP853",
+    traj_rtol: float = 1e-10,
+    traj_atol: float = 1e-10,
+    tangent_method: Literal["expm", "solve_ivp"] = "expm",
+) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+    """Python version close to the user's Julia ``Lyapunov_max``.
+
+    Workflow
+    --------
+    1. Solve the full trajectory first on a fixed grid.
+    2. At each saved point x_i, compute J(x_i).
+    3. Freeze J over one interval dt and evolve G via dG/dt = J G.
+    4. Gram–Schmidt step.
+    5. Accumulate log(diag(R)).
+
+    Parameters
+    ----------
+    tangent_method : {"expm", "solve_ivp"}
+        - "expm": exact propagation for frozen J, G(dt)=exp(J dt) G(0). Faster.
+        - "solve_ivp": integrates dG/dt = JG over the block, closer to the original Julia logic.
+    """
+    u_i = np.asarray(u_i, dtype=float)
+    t_eval = np.arange(0.0, N * dt, dt)
+
+    prob = solve_ivp(
+        fun=lambda t, u: rhs(t, u, p),
+        t_span=(0.0, N * dt),
+        y0=u_i,
+        t_eval=t_eval,
+        method=method,
+        rtol=traj_rtol,
+        atol=traj_atol,
+    )
+
+    if not prob.success:
+        raise RuntimeError(f"Trajectory solve failed: {prob.message}")
+
+    traj = prob.y.T
+    G = np.eye(2, dtype=float)
+
+    lam = np.zeros(2, dtype=float)
+    lam1 = np.zeros(2, dtype=float)
+    lam_t = np.zeros(N, dtype=float)
+
+    for i in range(N):
+        x = traj[i]
+        t_i = i * dt
+        J = jacobian(t_i, x, p)
+
+        if tangent_method == "expm":
+            G = expm(J * dt) @ G
+        else:
+            solG = solve_ivp(
+                fun=lambda t, g: G_evolution_frozenJ(t, g, J),
+                t_span=(0.0, dt),
+                y0=G.ravel(),
+                method=method,
+                t_eval=[dt],
+                rtol=err,
+                atol=err,
+            )
+            if not solG.success:
+                raise RuntimeError(f"Tangent solve failed at step {i}: {solG.message}")
+            G = solG.y[:, -1].reshape((2, 2))
+
+        G, R = GS(G)
+        diagR = np.diag(R)
+        diagR = np.where(np.abs(diagR) < 1e-300, 1e-300, diagR)
+
+        if (i + 1) * dt > transient_time:
+            lam += np.log(diagR)
+
+        lam1 += np.log(diagR)
+        lam_t[i] = np.max(lam1) / ((i + 1) * dt)
+
+    T = (N - transient_time / dt) * dt
+    if T <= 0:
+        raise ValueError("transient_time is too large compared to N*dt")
+
+    lam = lam / T
+    lam_max = float(np.max(lam))
+    return lam_max, lam_t, lam, traj
+
+
+def lyapunov_until_converged(
+    u0,
+    p,
+    *,
+    dt=1e-2,
+    max_time=1000.0,
+    min_time=100.0,
+    window_time=20.0,
+    std_tol=1e-4,
+    drift_tol=1e-4,
+    consecutive_windows=3,
+    method="DOP853",
+    rtol=1e-10,
+    atol=1e-10,
+    tangent_method="expm",
+):
+    """
+    Compute the largest Lyapunov exponent and stop automatically when the running
+    estimate becomes stable over a time window.
+
+    Stop rule:
+      - std of lambda_max(t) over last window < std_tol
+      - mean drift between consecutive windows < drift_tol
+      - t >= min_time
+      - condition satisfied for `consecutive_windows` consecutive checks
+    """
+
+    x = np.asarray(u0, dtype=float).copy()
+    G = np.eye(2, dtype=float)
 
     t = 0.0
-    t_end = t_trans + t_total
-    n_steps = int(np.ceil(t_end / delta_r))
-
     lam_sum = np.zeros(2, dtype=float)
-    elapsed = 0.0
-    times: List[float] = []
-    lam_max_t: List[float] = []
 
-    for _ in range(n_steps):
-        sol = solve_ivp(
-            fun=lambda tt, yy: state_tangent_rhs(tt, yy, p),
-            t_span=(t, t + delta_r),
-            y0=y,
+    times = []
+    lam_max_t = []
+    lam_local = []
+
+    window_n = max(5, int(np.ceil(window_time / dt)))
+    prev_window_mean = None
+    stable_counter = 0
+
+    while t < max_time:
+        # Jacobian frozen at the beginning of the block, as in your Julia logic
+        J = jacobian(t, x, p)
+
+        # propagate tangent matrix over one block
+        if tangent_method == "expm":
+            G = expm(J * dt) @ G
+        elif tangent_method == "solve_ivp":
+            solG = solve_ivp(
+                fun=lambda tt, g: G_evolution_frozenJ(tt, g, J),
+                t_span=(0.0, dt),
+                y0=G.ravel(),
+                t_eval=[dt],
+                method=method,
+                rtol=rtol,
+                atol=atol,
+            )
+            if not solG.success:
+                raise RuntimeError(f"Tangent solve failed at t={t}: {solG.message}")
+            G = solG.y[:, -1].reshape((2, 2))
+        else:
+            raise ValueError("tangent_method must be 'expm' or 'solve_ivp'")
+
+        # GS step
+        G, R = GS(G)
+
+        diagR = np.diag(R)
+        diagR = np.where(np.abs(diagR) < 1e-300, 1e-300, diagR)
+
+        lam_step = np.log(diagR) / dt
+        lam_local.append(lam_step.copy())
+
+        lam_sum += np.log(diagR)
+
+        # propagate the base trajectory to the next saved point
+        solx = solve_ivp(
+            fun=lambda tt, uu: rhs(tt, uu, p),
+            t_span=(t, t + dt),
+            y0=x,
+            t_eval=[t + dt],
             method=method,
             rtol=rtol,
             atol=atol,
         )
-        if not sol.success:
-            raise RuntimeError(sol.message)
+        if not solx.success:
+            raise RuntimeError(f"Trajectory solve failed at t={t}: {solx.message}")
 
-        y = sol.y[:, -1].copy()
-        t = float(sol.t[-1])
+        x = solx.y[:, -1]
+        t += dt
 
-        g = y[2:].reshape(2, 2)
-        q, r = np.linalg.qr(g)
+        lam_running = np.max(lam_sum) / t
+        times.append(t)
+        lam_max_t.append(lam_running)
 
-        # keep diagonal positive when possible
-        for j in range(2):
-            if r[j, j] < 0:
-                r[j, :] *= -1.0
-                q[:, j] *= -1.0
+        # check convergence only after enough time and enough points
+        if t >= min_time and len(lam_max_t) >= window_n:
+            window = np.array(lam_max_t[-window_n:], dtype=float)
+            window_mean = float(np.mean(window))
+            window_std = float(np.std(window))
 
-        y[2:] = q.ravel()
+            if prev_window_mean is None:
+                drift = np.inf
+            else:
+                drift = abs(window_mean - prev_window_mean)
 
-        if t > t_trans:
-            lam_sum += np.log(np.abs(np.diag(r)))
-            elapsed += delta_r
-            times.append(t)
-            lam_max_t.append(float(np.max(lam_sum) / elapsed))
+            prev_window_mean = window_mean
 
-    lam = lam_sum / elapsed
+            if (window_std < std_tol) and (drift < drift_tol):
+                stable_counter += 1
+            else:
+                stable_counter = 0
+
+            if stable_counter >= consecutive_windows:
+                break
+
+    lam = lam_sum / t
     lam_max = float(np.max(lam))
-    return lam, lam_max, np.asarray(times), np.asarray(lam_max_t)
+
+    return {
+        "lam": lam,
+        "lam_max": lam_max,
+        "times": np.asarray(times),
+        "lam_max_t": np.asarray(lam_max_t),
+        "lam_local": np.asarray(lam_local),
+        "stop_time": t,
+        "converged": stable_counter >= consecutive_windows,
+        "window_n": window_n,
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -451,11 +708,11 @@ def lyapunov_spectrum(
 # -----------------------------------------------------------------------------
 
 def undriven_fixed_point_equation(phi: float, p: FluxoniumParams) -> float:
-    """Equation defining undriven fixed points for A_charge = A_flux = 0.
-
-    n* = 0 and EL(phi* - phi_ext0) + EJ sin(phi*) = 0.
-    """
-    return p.EL * (phi - p.phi_ext0) + p.EJ * np.sin(phi)
+    """Equation defining undriven fixed points for A_charge = A_flux = 0."""
+    _validate_params(p)
+    if p.gauge == "inductive":
+        return p.EL * (phi - p.phi_ext0) + p.EJ * np.sin(phi)
+    return p.EL * phi + p.EJ * np.sin(phi - p.phi_ext0)
 
 
 def find_undriven_fixed_points(
@@ -491,11 +748,13 @@ def find_undriven_fixed_points(
 
 
 def classify_undriven_fixed_point(phi_star: float, p: FluxoniumParams, *, tol: float = 1e-12) -> Dict[str, object]:
-    """Classify linear stability of an undriven fixed point.
+    """Classify linear stability of an undriven fixed point."""
+    _validate_params(p)
+    if p.gauge == "inductive":
+        kappa = p.EL + p.EJ * np.cos(phi_star)
+    else:
+        kappa = p.EL + p.EJ * np.cos(phi_star - p.phi_ext0)
 
-    J* = [[0, 8 EC], [-(EL + EJ cos(phi*)), 0]]
-    """
-    kappa = p.EL + p.EJ * np.cos(phi_star)
     if kappa > tol:
         omega_loc = np.sqrt(8.0 * p.EC * kappa)
         eigvals = np.array([1j * omega_loc, -1j * omega_loc])
@@ -631,20 +890,26 @@ __all__ = [
     "FluxoniumParams",
     "drive_period",
     "wrap_to_pi",
+    "wrap_to_center",
     "phi_ext_t",
     "potential",
-    "find_potential_extrema",
     "hamiltonian",
     "dHdt_explicit",
     "rhs",
     "jacobian",
     "state_tangent_rhs",
+    "find_potential_extrema",
     "integrate_trajectory",
     "solve_with_work",
     "energy_balance_from_augmented_solution",
     "make_initial_conditions",
     "poincare_section",
+    "GS",
+    "G_evolution_frozenJ",
+    "lyapunov_max_julia_style",
     "lyapunov_spectrum",
+    "lyapunov_spectrum_fixed_blocks",
+    "lyapunov_spectrum_rk4",
     "undriven_fixed_point_equation",
     "find_undriven_fixed_points",
     "classify_undriven_fixed_point",
