@@ -26,7 +26,7 @@ from fluxonium_classical import FluxoniumParams, lyapunov_until_converged, make_
 EC, EJ, EL = 1.0, 3.6, 0.7
 phi_ext0 = 2*np.pi*0.5
 A_flux =0.
-sq_num_ics = 2 # sq_num_ics^2 is the number of ICs
+sq_num_ics = 10 # sq_num_ics^2 is the number of ICs
 
 
 N_density = 3
@@ -63,10 +63,14 @@ def parse_args():
         default=outfile,
         help="Output HDF5 file.",
     )
+    parser.add_argument("--EC", type=float, default=EC, help="Charging energy.")
+    parser.add_argument("--EJ", type=float, default=EJ, help="Josephson energy.")
+    parser.add_argument("--EL", type=float, default=EL, help="Inductive energy.")
+    parser.add_argument("--phi-ext0", type=float, default=phi_ext0, help="Static external flux.")
     return parser.parse_args()
 
 
-def save_h5(path, lambda_matrix, stop_time_matrix, converged_matrix):
+def save_h5(path, lambda_matrix, stop_time_matrix, converged_matrix, run_params):
     tmp_path = path.with_suffix(".tmp.h5")
     with h5py.File(tmp_path, "w") as h5:
         h5.create_dataset("omega_ds", data=omega_ds)
@@ -75,10 +79,10 @@ def save_h5(path, lambda_matrix, stop_time_matrix, converged_matrix):
         h5.create_dataset("stop_time_matrix", data=stop_time_matrix)
         h5.create_dataset("converged_matrix", data=converged_matrix)
 
-        h5.attrs["EC"] = EC
-        h5.attrs["EJ"] = EJ
-        h5.attrs["EL"] = EL
-        h5.attrs["phi_ext0"] = phi_ext0
+        h5.attrs["EC"] = run_params["EC"]
+        h5.attrs["EJ"] = run_params["EJ"]
+        h5.attrs["EL"] = run_params["EL"]
+        h5.attrs["phi_ext0"] = run_params["phi_ext0"]
         h5.attrs["A_flux"] = A_flux
         h5.attrs["sq_num_ics"] = sq_num_ics
         h5.attrs["N_density"] = N_density
@@ -90,16 +94,16 @@ def save_h5(path, lambda_matrix, stop_time_matrix, converged_matrix):
         h5.attrs["drift_tol"] = drift_tol
         h5.attrs["consecutive_windows"] = consecutive_windows
         h5.attrs["tangent_method"] = tangent_method
-    tmp_path.replace(path)
+    tmp_path.replace(path) # Still dont understand very well
 
 
 def compute_grid_point(task):
-    i, j, omega_d, A_charge = task
+    i, j, omega_d, A_charge, run_params = task
     param = FluxoniumParams(
-        EC=EC,
-        EJ=EJ,
-        EL=EL,
-        phi_ext0=phi_ext0,
+        EC=run_params["EC"],
+        EJ=run_params["EJ"],
+        EL=run_params["EL"],
+        phi_ext0=run_params["phi_ext0"],
         omega_d=omega_d,
         A_charge=A_charge,
         A_flux=A_flux,
@@ -150,20 +154,27 @@ def main():
     args = parse_args()
     args.outfile.parent.mkdir(parents=True, exist_ok=True)
 
+    run_params = {
+        "EC": args.EC,
+        "EJ": args.EJ,
+        "EL": args.EL,
+        "phi_ext0": args.phi_ext0,
+    }
+
     lambda_matrix = np.full((N_density, N_density), np.nan, dtype=float)
     stop_time_matrix = np.full((N_density, N_density), np.nan, dtype=float)
     converged_matrix = np.zeros((N_density, N_density), dtype=bool)
 
     tasks = [
-        (i, j, float(omega_d), float(A_charge))
+        (i, j, float(omega_d), float(A_charge), run_params)
         for i, omega_d in enumerate(omega_ds)
         for j, A_charge in enumerate(A_charges)
-    ]
+    ] #creates the tasks
 
-    workers = max(1, min(args.workers, len(tasks)))
+    workers = max(1, min(args.workers, len(tasks))) #prevents bad workes count. 
     print(f"Running {len(tasks)} grid points with {workers} worker(s).", flush=True)
 
-    if workers == 1:
+    if workers == 1: # if I don't want t opara
         completed = 0
         for task in tasks:
             i, j, lam, stop_time, converged = compute_grid_point(task)
@@ -177,11 +188,13 @@ def main():
                 f"lambda={lam:.6g}",
                 flush=True,
             )
-            save_h5(args.outfile, lambda_matrix, stop_time_matrix, converged_matrix)
+            save_h5(args.outfile, lambda_matrix, stop_time_matrix, converged_matrix, run_params)
     else:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        with ProcessPoolExecutor(max_workers=workers) as executor: #start multiple workers
+            #every task for each worker 
             futures = [executor.submit(compute_grid_point, task) for task in tasks]
-            for completed, future in enumerate(as_completed(futures), start=1):
+            #Collect results as they finish
+            for completed, future in enumerate(as_completed(futures), start=1): 
                 i, j, lam, stop_time, converged = future.result()
                 lambda_matrix[i, j] = lam
                 stop_time_matrix[i, j] = stop_time
@@ -192,7 +205,7 @@ def main():
                     f"lambda={lam:.6g}",
                     flush=True,
                 )
-                save_h5(args.outfile, lambda_matrix, stop_time_matrix, converged_matrix)
+                save_h5(args.outfile, lambda_matrix, stop_time_matrix, converged_matrix, run_params)
 
     print(f"Saved {args.outfile}", flush=True)
 
